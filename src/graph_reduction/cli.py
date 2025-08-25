@@ -1,210 +1,174 @@
 """
-Command-line interface for running graph reduction experiments.
+Command-line interface for running standardized graph reduction experiments.
 """
 
 import typer
-import networkx as nx
-from pathlib import Path
-from typing import List, Optional, Annotated
 import time
+import traceback
+from pathlib import Path
+from typing import List, Optional, Annotated, Dict
+from enum import Enum
 from .analysis.spectral import analyze_single_graph_properties
-from .io import load_graph, save_reduced_graph, save_metrics_excel, save_metrics_csv, save_metrics_json, save_adjacency_matrix, iter_graph_files
-from .core.coarseners import CoarseNetCoarsener
+from .io import load_graph, save_reduced_graph, save_metrics_excel, save_metrics_csv, save_metrics_json, iter_graph_files
+from .core.coarseners import CoarseNetCoarsener, CoCoNUTCoarsener, BaseCoarsener
 
 app = typer.Typer(add_completion=False, context_settings={"help_option_names": ["-h", "--help"]})
 
-import traceback
+class Method(str, Enum):
+    coarsenet = "coarsenet"
+    coconut = "coconut"
+
+class Metric(str, Enum):
+    spectral_ratio_L = "spectral_ratio_L"
+    spectral_gap_A = "spectral_gap_A"
+    algebraic_connectivity_L = "algebraic_connectivity_L"
+    spectral_radius_A = "spectral_radius_A"
+
+METRIC_NAME_MAP = {
+    'spectral_ratio_L': 'Spectral Ratio of L',
+    'spectral_gap_A': 'Spectral Gap of A',
+    'algebraic_connectivity_L': 'Algebraic Connectivity of L',
+    'spectral_radius_A': 'Spectral Radius of A',
+    # AÑADIDO: Nombres para las nuevas métricas fijas
+    'Number of Nodes': 'Number of Nodes',
+    'Number of Edges': 'Number of Edges'
+}
 
 @app.command()
-def run_coarsenet(
-    data_dir: Annotated[Path, typer.Argument(help="Directory containing BigNets graph files")],
-    output_dir: Annotated[Optional[Path], typer.Option("--output", "-o", help="Output directory for results")] = None,
-    ratios: Annotated[List[float], typer.Option("--ratios", "-r", help="Reduction ratios (e.g., -r 0.3 0.5)")] = None,
-    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Verbose output")] = False,
-    save_graphs: Annotated[bool, typer.Option("--save-graphs", help="Save reduced graphs")] = True,
-    save_matrices: Annotated[bool, typer.Option("--save-matrices", help="Save adjacency matrices")] = False,
-    output_format: Annotated[str, typer.Option("--format", "-f", help="Output format (excel, csv, json)")] = "excel"
+def run_experiment(
+    data_dir: Annotated[Path, typer.Argument(help="Directory containing graph files.")],
+    method: Annotated[Method, typer.Option(help="Coarsening algorithm to use.")],
+    metrics_to_compute: Annotated[Optional[List[Metric]], typer.Option("--metric", "-m", help="Spectral metric to compute. Can be used multiple times.")] = None,
+    output_dir: Annotated[Optional[Path], typer.Option("--output", "-o", help="Output directory for results.")] = None,
+    ratios: Annotated[List[float], typer.Option("--ratios", "-r", help="List of reduction ratios.")] = None,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose output.")] = False,
+    save_graphs: Annotated[bool, typer.Option(help="Save the reduced graph files.")] = True,
+    output_format: Annotated[str, typer.Option("--format", "-f", help="Output format for metrics (excel, csv, json).")] = "excel"
 ):
     """
-    Run CoarseNet experiments on BigNets dataset with multiple reduction ratios.
+    Run a graph reduction experiment with a specified method, dataset, and metrics.
     """
-    # Use default ratios if none are provided
-    ratio_list = ratios if ratios is not None else [0.1]
+    coarseners: Dict[str, BaseCoarsener] = {
+        "coarsenet": CoarseNetCoarsener(), 
+        "coconut": CoCoNUTCoarsener()
+    }
+    coarsener = coarseners[method.value]
 
-    # Validate ratios list
-    if not ratio_list:
-        typer.echo("Please provide at least one reduction ratio (e.g., -r 0.3 0.5 0.7)")
+    ratio_list = ratios if ratios else [0.1, 0.3, 0.5, 0.7, 0.9]
+    if not all(0 < r < 1 for r in ratio_list):
+        typer.echo("Error: All reduction ratios must be between 0 and 1.")
         raise typer.Exit(code=1)
-    for ratio in ratio_list:
-        if not (0 < ratio < 1):
-            typer.echo(f"Reduction ratio must be between 0 and 1, got: {ratio}")
-            raise typer.Exit(code=1)
 
-    # Create output directory
     if output_dir is None:
         timestamp = int(time.time())
-        output_dir = Path("results") / f"coarsenet_experiment_{timestamp}"
-
+        output_dir = Path("results") / f"{method.value}_{data_dir.name}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Get graph files
+    
     graphs = iter_graph_files(data_dir)
     if not graphs:
-        typer.echo(f"No graph files found in {data_dir}")
+        typer.echo(f"Error: No graph files found in {data_dir}")
         raise typer.Exit(code=1)
 
-    typer.echo(f"Found {len(graphs)} graphs in {data_dir}")
-    typer.echo(f"Testing reduction ratios: {ratio_list}")
-    typer.echo(f"Output directory: {output_dir}")
+    typer.echo(f"Starting experiment: Method='{method.value}', Dataset='{data_dir.name}'")
+    typer.echo(f"Found {len(graphs)} graphs to process.")
+    typer.echo(f"Testing reduction ratios: {sorted(ratio_list)}")
+    typer.echo(f"Output will be saved to: {output_dir}")
 
-    # Initialize coarsener
-    coarsener = CoarseNetCoarsener()
-
-    # Results storage
     all_results = []
+    
+    if not metrics_to_compute:
+        metrics_to_compute = [m.value for m in Metric]
+        typer.echo(f"No specific metrics selected. Computing all: {metrics_to_compute}")
 
-    # Process each graph with all ratios
     for graph_name, graph_file in graphs.items():
-        print(f"\n{'='*60}")
-        print(f"Processing: {graph_name}")
-        print(f"{'='*60}")
-
+        print(f"\n{'='*60}\nProcessing: {graph_name}\n{'='*60}")
+        graph_start_time = time.monotonic()
         try:
-            # Load graph
-            G = load_graph(graph_file)
-            print(f"Loaded graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-
-            # Analyze original graph properties once
+            try:
+                G = load_graph(graph_file)
+                print(f"Loaded graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+            except Exception as e:
+                print(f"✗ FAILED to load {graph_name}. Error: {e}. Skipping this graph.")
+                continue
+            
             original_metrics = analyze_single_graph_properties(G)
-            original_metrics['Number of Nodes'] = G.number_of_nodes()
-            original_metrics['Number of Edges'] = G.number_of_edges()
-
-            # Coarsen graph with all ratios
+            
             reduced_graphs = coarsener.coarsen_with_intermediate_checkpoints(G, ratio_list, verbose=verbose)
 
-            # Calculate metrics for each reduction ratio
-            for ratio in ratio_list:
-                if ratio in reduced_graphs:
-                    G_reduced = reduced_graphs[ratio]
+            for ratio in sorted(ratio_list):
+                if ratio not in reduced_graphs:
+                    print(f"Warning: No reduced graph found for ratio {ratio}. Skipping.")
+                    continue
+                G_reduced = reduced_graphs[ratio]
+                
+                ratio_start_time = time.monotonic()
+                reduced_metrics = analyze_single_graph_properties(G_reduced)
+                ratio_end_time = time.monotonic()
+                duration = ratio_end_time - ratio_start_time
 
-                    # Analyze reduced graph properties
-                    reduced_metrics = analyze_single_graph_properties(G_reduced)
-                    reduced_metrics['Number of Nodes'] = G_reduced.number_of_nodes()
-                    reduced_metrics['Number of Edges'] = G_reduced.number_of_edges()
+                print(f"  -> Analyzing ratio {ratio:.2f} (Reduced Graph: {G_reduced.number_of_nodes()} nodes) - Time: {duration:.2f}s")
+                
+                base_info = {'Network': graph_name, 'Method': method.value, 'Alpha': ratio}
 
-                    # Mapping from internal keys to desired output names
-                    metric_mapping = {
-                        'spectral_ratio_L': 'Spectral Ratio of L',
-                        'eigenratio': 'Eigenratio',
-                        'spectral_gap_A': 'Spectral Gap of A',
-                        'algebraic_connectivity_L': 'Algebraic Connectivity of L',
-                        'spectral_radius_A': 'Spectral Radius of A',
-                        'Number of Nodes': 'Number of Nodes',
-                        'Number of Edges': 'Number of Edges'
-                    }
+                # Procesa las métricas espectrales seleccionadas por el usuario
+                for key in metrics_to_compute:
+                    original_value = original_metrics.get(key)
+                    reduced_value = reduced_metrics.get(key)
+                    reduction_perc = ((original_value - reduced_value) / original_value * 100) if original_value else 0.0
+                    
+                    all_results.append({
+                        **base_info,
+                        'Metric': METRIC_NAME_MAP[key],
+                        'Original': original_value,
+                        'Reduced': reduced_value,
+                        'Reduction (%)': reduction_perc
+                    })
+                
+                # AÑADIDO: Añade siempre el número de nodos y aristas a los resultados
+                nodes_orig = G.number_of_nodes()
+                nodes_red = G_reduced.number_of_nodes()
+                edges_orig = G.number_of_edges()
+                edges_red = G_reduced.number_of_edges()
 
-                    # Transform results into the specified long format
-                    for key, metric_name in metric_mapping.items():
-                        if key in original_metrics and key in reduced_metrics:
-                            original_value = original_metrics[key]
-                            reduced_value = reduced_metrics[key]
+                all_results.append({
+                    **base_info,
+                    'Metric': METRIC_NAME_MAP['Number of Nodes'],
+                    'Original': nodes_orig,
+                    'Reduced': nodes_red,
+                    'Reduction (%)': (1 - nodes_red / nodes_orig) * 100 if nodes_orig > 0 else 0
+                })
+                all_results.append({
+                    **base_info,
+                    'Metric': METRIC_NAME_MAP['Number of Edges'],
+                    'Original': edges_orig,
+                    'Reduced': edges_red,
+                    'Reduction (%)': (1 - edges_red / edges_orig) * 100 if edges_orig > 0 else 0
+                })
 
-                            # Calculate reduction percentage, handling division by zero
-                            if original_value is not None and original_value != 0:
-                                reduction_perc = (original_value - reduced_value) / original_value * 100
-                            else:
-                                reduction_perc = 0.0
+                if save_graphs:
+                    output_file = output_dir / graph_name / f"{graph_name}_reduced_{method.value}_{ratio:.2f}.gml"
+                    output_file.parent.mkdir(parents=True, exist_ok=True)
+                    save_reduced_graph(G_reduced, output_file)
+            
+            graph_end_time = time.monotonic()
+            print(f"\n✓ Completed {graph_name} in {graph_end_time - graph_start_time:.2f}s")
 
-                            result_row = {
-                                'Network': graph_name,
-                                'Method': 'CoarseNet',
-                                'Alpha': ratio,
-                                'Metric': metric_name,
-                                'Original': original_value,
-                                'Reduced': reduced_value,
-                                'Reduction (%)': reduction_perc
-                            }
-                            all_results.append(result_row)
-
-                    # Save reduced graph if requested
-                    if save_graphs:
-                        output_file = output_dir / graph_name / f"{graph_name}_reduced_{ratio:.2f}.gml"
-                        output_file.parent.mkdir(parents=True, exist_ok=True)
-                        save_reduced_graph(G_reduced, output_file)
-
-            # Save metrics after processing all ratios for a graph
-            if all_results:
-                if output_format.lower() == "excel":
-                    results_path = output_dir / "coarsenet_results.xlsx"
-                    save_metrics_excel(all_results, results_path)
-                elif output_format.lower() == "csv":
-                    results_path = output_dir / "coarsenet_results.csv"
-                    save_metrics_csv(all_results, results_path)
-                elif output_format.lower() == "json":
-                    results_path = output_dir / "coarsenet_results.json"
-                    save_metrics_json(all_results, results_path)
-                print(f"✓ Completed {graph_name} - Metrics updated in {results_path}")
-
-        except Exception as e:
-            print(f"✗ An error occurred while processing {graph_name}. The original error was:")
-            # This prints the full traceback of the INITIAL error without triggering repr
-            traceback.print_exc() 
+        except Exception:
+            print(f"✗ An unexpected error occurred while processing {graph_name}:")
+            traceback.print_exc()
             continue
 
-    # Print final summary
-    if all_results:
-        typer.echo(f"\n{'='*60}")
-        typer.echo("Experiment completed!")
-
-        # Print summary
-        typer.echo(f"\nExperiment Summary:")
-        typer.echo(f"  Total graphs processed: {len(graphs)}")
-        typer.echo(f"  Total result rows: {len(all_results)}")
-        typer.echo(f"  Reduction ratios tested: {ratio_list}")
-        typer.echo(f"  Output directory: {output_dir}")
-        file_ext = 'xlsx' if output_format.lower() not in ['csv', 'json'] else output_format.lower()
-        typer.echo(f"  Results file: {output_dir}/coarsenet_results.{file_ext}")
-
-    else:
-        typer.echo("No results to save.")
+    if not all_results:
+        typer.echo("Experiment finished, but no results were generated.")
         raise typer.Exit(code=1)
 
+    format_extensions = {'excel': 'xlsx', 'csv': 'csv', 'json': 'json'}
+    file_ext = format_extensions.get(output_format.lower(), output_format.lower())
+    results_path = output_dir / f"{method.value}_{data_dir.name}_results.{file_ext}"
+    
+    save_func = {'excel': save_metrics_excel, 'csv': save_metrics_csv, 'json': save_metrics_json}.get(output_format.lower())
+    if save_func:
+        save_func(all_results, results_path)
 
-@app.command()
-def info(
-    data_dir: Path = typer.Argument(..., help="Directory containing graph files")
-):
-    """
-    Display information about available graphs in the dataset.
-    """
-    graphs = iter_graph_files(data_dir)
-
-    if not graphs:
-        typer.echo(f"No graph files found in {data_dir}")
-        return
-
-    typer.echo(f"Found {len(graphs)} graphs in {data_dir}:")
-    typer.echo("-" * 50)
-
-    for graph_name, graph_path in graphs.items():
-        try:
-            G = load_graph(graph_path)
-            nodes = G.number_of_nodes()
-            edges = G.number_of_edges()
-            is_directed = G.is_directed()
-            is_weighted = nx.is_weighted(G)
-
-            typer.echo(f"{graph_name}:")
-            typer.echo(f"  Nodes: {nodes}")
-            typer.echo(f"  Edges: {edges}")
-            typer.echo(f"  Directed: {is_directed}")
-            typer.echo(f"  Weighted: {is_weighted}")
-            typer.echo(f"  File: {graph_path.name}")
-            typer.echo()
-
-        except Exception as e:
-            typer.echo(f"{graph_name}: Error loading - {e}")
-
-
-if __name__ == "__main__":
-    app()
+    typer.echo(f"\n{'='*60}\nExperiment complete!\n{'='*60}")
+    typer.echo(f"Results for {len(graphs)} graphs saved to: {results_path}")

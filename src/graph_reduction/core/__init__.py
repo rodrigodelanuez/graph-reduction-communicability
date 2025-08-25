@@ -2,6 +2,6 @@
 Core coarsening strategies module.
 """
 
-from .coarseners import CoarseNetCoarsener, coarsenet
+from .coarseners import BaseCoarsener, CoarseNetCoarsener, CoCoNUTCoarsener
 
-__all__ = ["CoarseNetCoarsener", "coarsenet"]
+__all__ = ["BaseCoarsener", "CoarseNetCoarsener", "CoCoNUTCoarsener"]
